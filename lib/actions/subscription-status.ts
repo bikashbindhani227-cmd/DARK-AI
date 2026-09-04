@@ -1,0 +1,111 @@
+"use server";
+
+import { stripe } from "../../app/api/stripe";
+import { isExpectedBillingContextError } from "@/lib/actions/billing-action-errors";
+import { getBillingActionContext } from "@/lib/actions/billing-context";
+import { phLogger } from "@/lib/posthog/server";
+import type { SubscriptionCancellationStatus } from "@/lib/billing/api-types";
+import { stripeObjectId } from "@/lib/billing/subscription-payment-failure";
+
+type CurrentSubscriptionStatus = NonNullable<
+  SubscriptionCancellationStatus["subscriptionStatus"]
+>;
+
+function isCurrentSubscriptionStatus(
+  status: string,
+): status is CurrentSubscriptionStatus {
+  return ["active", "trialing", "past_due", "unpaid"].includes(status);
+}
+
+function hasCurrentSubscriptionStatus<T extends { status: string }>(
+  subscription: T,
+): subscription is T & { status: CurrentSubscriptionStatus } {
+  return isCurrentSubscriptionStatus(subscription.status);
+}
+
+function currentPeriodEndMs(subscription: unknown): number | undefined {
+  const currentPeriodEnd = (subscription as { current_period_end?: unknown })
+    .current_period_end;
+  return typeof currentPeriodEnd === "number" &&
+    Number.isFinite(currentPeriodEnd) &&
+    currentPeriodEnd > 0
+    ? currentPeriodEnd * 1000
+    : undefined;
+}
+
+export default async function getSubscriptionCancellationStatusAction(): Promise<SubscriptionCancellationStatus> {
+  const startedAt = Date.now();
+  const context = await getBillingActionContext().catch((error) => {
+    if (isExpectedBillingContextError(error)) {
+      throw error;
+    }
+
+    phLogger.error("billing_subscription_status_action_failed", {
+      event: "billing_subscription_status_action_failed",
+      stage: "billing_context",
+      duration_ms: Date.now() - startedAt,
+      error,
+    });
+    throw error;
+  });
+  const stripeCustomerId = context.stripeCustomerId;
+  const billingFields = {
+    userId: context.user.id,
+    org_id: context.organizationId,
+    stripe_customer_id: stripeCustomerId,
+  };
+
+  let subscriptions: Awaited<ReturnType<typeof stripe.subscriptions.list>>;
+  try {
+    subscriptions = await stripe.subscriptions.list({
+      customer: stripeCustomerId,
+      status: "all",
+      limit: 10,
+      expand: ["data.items.data.price"],
+    });
+  } catch (error) {
+    phLogger.error("billing_subscription_status_action_failed", {
+      event: "billing_subscription_status_action_failed",
+      ...billingFields,
+      stage: "stripe_subscription_list",
+      duration_ms: Date.now() - startedAt,
+      error,
+    });
+    throw error;
+  }
+  const currentSubscription = subscriptions.data.find(
+    hasCurrentSubscriptionStatus,
+  );
+
+  if (!currentSubscription) {
+    return {
+      hasActiveSubscription: false,
+      cancelAtPeriodEnd: false,
+    };
+  }
+
+  const latestInvoiceId = stripeObjectId(currentSubscription.latest_invoice);
+  const item = currentSubscription.items?.data[0];
+  const price = item?.price;
+  const renewalAmountDollars =
+    price?.unit_amount == null
+      ? undefined
+      : (price.unit_amount * (item.quantity ?? 1)) / 100;
+  return {
+    hasActiveSubscription: true,
+    cancelAtPeriodEnd: currentSubscription.cancel_at_period_end === true,
+    currentPeriodEnd: currentPeriodEndMs(currentSubscription),
+    subscriptionStatus: currentSubscription.status,
+    ...(latestInvoiceId && { latestInvoiceId }),
+    ...(price?.id && { stripePriceId: price.id }),
+    ...(price?.lookup_key && { stripePriceLookupKey: price.lookup_key }),
+    ...(renewalAmountDollars !== undefined && { renewalAmountDollars }),
+    ...(price?.currency && { renewalCurrency: price.currency }),
+    ...(price?.recurring?.interval && {
+      renewalInterval: price.recurring.interval,
+    }),
+    ...(price?.recurring?.interval_count && {
+      renewalIntervalCount: price.recurring.interval_count,
+    }),
+  };
+}

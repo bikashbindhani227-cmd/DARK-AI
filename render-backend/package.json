@@ -1,0 +1,15 @@
+{
+  "name": "dark-ai-backend",
+  "private": true,
+  "type": "module",
+  "scripts": { "start": "node server.mjs" },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "@ai-sdk/openai": "3.0.74",
+    "ai": "6.0.200",
+    "cors": "^2.8.5",
+    "express": "^5.1.0",
+    "firebase-admin": "^13.6.1",
+    "zod": "^4.5.4"
+  }
+}
